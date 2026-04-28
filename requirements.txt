@@ -2,4 +2,4 @@ numpy
 pandas
 pybit
 requests
-pandas_ta
+pandas-ta-classic
