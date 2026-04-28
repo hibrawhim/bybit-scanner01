@@ -1,7 +1,7 @@
 import os
 import requests
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 from pybit.unified_trading import HTTP
 
 # --- Configuration ---
