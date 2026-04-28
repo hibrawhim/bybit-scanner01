@@ -5,74 +5,78 @@ import pandas_ta_classic as ta
 from pybit.unified_trading import HTTP
 
 # --- Configuration ---
-SYMBOL_CATEGORY = "linear"  # USDT Perpetual
-TIMEFRAME = "60"            # 1 Hour
+SYMBOL_CATEGORY = "linear"
+TIMEFRAME = "60"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 session = HTTP(testnet=False)
 
-def get_symbols():
-    """Fetches all USDT Perpetual pairs on Bybit."""
-    try:
-        resp = session.get_instruments_info(category=SYMBOL_CATEGORY)
-        return [i['symbol'] for i in resp['result']['list'] if i['quoteCoin'] == 'USDT' and i['status'] == 'Trading']
-    except Exception as e:
-        print(f"Error fetching symbols: {e}")
-        return []
-
 def send_telegram(message):
-    """Sends signal to your Telegram Bot."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Telegram Failed: {e}")
 
 def scan():
-    symbols = get_symbols()
-    print(f"Starting scan for {len(symbols)} symbols...")
+    send_telegram("🔍 *Scanner Online*: Checking 1H Confirmed Bars...")
     
+    resp = session.get_instruments_info(category=SYMBOL_CATEGORY)
+    # Error Handling for Symbol List
+    if resp.get('retCode') != 0:
+        print(f"Bybit API Error (Symbols): {resp.get('retCode')} - {resp.get('retMsg')}")
+        return
+
+    symbols = [i['symbol'] for i in resp['result']['list'] if i['quoteCoin'] == 'USDT' and i['status'] == 'Trading']
+    print(f"Scanning {len(symbols)} symbols...")
+
     for symbol in symbols:
         try:
-            # Fetch last 50 candles for indicator stability
             kline = session.get_kline(category=SYMBOL_CATEGORY, symbol=symbol, interval=TIMEFRAME, limit=50)
+            
+            # Error Handling for Kline Data
+            if kline.get('retCode') != 0:
+                print(f"Skipping {symbol}: {kline.get('retMsg')} (Code: {kline.get('retCode')})")
+                continue
+
             df = pd.DataFrame(kline['result']['list'], columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'turnover'])
             df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].apply(pd.to_numeric)
             df = df.iloc[::-1].reset_index(drop=True) 
 
-            # --- Technical Indicators ---
+            # Indicators
             df['sma_h'] = ta.sma(df['high'], length=7)
             df['sma_l'] = ta.sma(df['low'], length=7)
             
-            # Hammer & Rejection Logic
+            # Hammer logic
             df['body'] = (df['close'] - df['open']).abs()
             df['tr'] = df['high'] - df['low']
             df['is_ham'] = (df['body'] > 0) & ((df['tr'] / df['body']) > 2.0)
             
-            # Extract current and previous rows
-            curr = df.iloc[-1]
-            prev = df.iloc[-2]
+            # --- SHIFT TO CONFIRMED BARS ---
+            # index -1 = Live bar (ignore)
+            # index -2 = Last Confirmed Bar (The Signal Bar)
+            # index -3 = The "Setup" Bar
+            confirmed = df.iloc[-2]
+            setup = df.iloc[-3]
             
-            # Clean State Check (Bodies outside channel)
-            is_clean_below_prev = (prev['open'] < prev['sma_l']) and (prev['close'] < prev['sma_l'])
-            is_clean_above_prev = (prev['open'] > prev['sma_h']) and (prev['close'] > prev['sma_h'])
+            # Logic: Setup was "Clean" outside, Confirmed bar "Rejects" back
+            is_clean_below_setup = (setup['open'] < setup['sma_l']) and (setup['close'] < setup['sma_l'])
+            is_clean_above_setup = (setup['open'] > setup['sma_h']) and (setup['close'] > setup['sma_h'])
             
-            # Trigger logic: Price was "Clean" outside, now it "Rejects" (wicks back into channel)
-            # Bear Rejection: Previous candle was clean below, current high touches/crosses sma_l
-            bear_reject = is_clean_below_prev and curr['high'] > prev['sma_l']
-            
-            # Bull Rejection: Previous candle was clean above, current low touches/crosses sma_h
-            bull_reject = is_clean_above_prev and curr['low'] < prev['sma_h']
+            bear_reject = is_clean_below_setup and confirmed['high'] > setup['sma_l']
+            bull_reject = is_clean_above_setup and confirmed['low'] < setup['sma_h']
 
             if bear_reject:
-                send_telegram(f"🔴 *BEAR REJECTION*: {symbol}\nTimeframe: 1H\nPrice rejected lower channel boundary.")
-                print(f"Signal found: {symbol} BEAR")
-                
+                send_telegram(f"🔴 *BEAR REJECTION*: {symbol}\nTime: {confirmed['ts']}\nType: Confirmed 1H Close")
+                print(f"MATCH: {symbol} BEAR")
             if bull_reject:
-                send_telegram(f"🟢 *BULL REJECTION*: {symbol}\nTimeframe: 1H\nPrice rejected upper channel boundary.")
-                print(f"Signal found: {symbol} BULL")
+                send_telegram(f"🟢 *BULL REJECTION*: {symbol}\nTime: {confirmed['ts']}\nType: Confirmed 1H Close")
+                print(f"MATCH: {symbol} BULL")
 
         except Exception as e:
-            continue # Skip errors to keep the scanner moving
+            print(f"System Error on {symbol}: {str(e)}")
 
 if __name__ == "__main__":
     scan()
